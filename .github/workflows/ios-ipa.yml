@@ -1,0 +1,98 @@
+name: Build iOS IPA
+
+# 在 GitHub 的 macOS 26 运行器上编译 SwiftUI 工程，产出未签名 .ipa
+# 触发方式：网页 Actions → Build iOS IPA → Run workflow，或 push 到 main
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-ipa.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Toolchain info
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Build unsigned .app
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Yimeng.xcodeproj \
+            -scheme Yimeng \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build 2>&1 | tee build.log | tail -n 150
+
+      - name: Package IPA
+        if: success()
+        working-directory: ios
+        run: |
+          APP="build/Build/Products/Release-iphoneos/Yimeng.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::missing $APP"
+            find build/Build/Products -maxdepth 2 -name '*.app' -o -maxdepth 2 -name '*.appex' | head -50
+            exit 1
+          fi
+          rm -rf Payload Yimeng-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Yimeng-unsigned.ipa Payload
+          ls -lh Yimeng-unsigned.ipa
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist"
+          ls "$APP/PlugIns" 2>/dev/null || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yimeng-ipa
+          path: |
+            ios/Yimeng-unsigned.ipa
+            ios/build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish IPA to Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="ipa-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" ios/Yimeng-unsigned.ipa \
+            --title "译梦 IPA $TAG" \
+            --notes "Unsigned IPA built from ${GITHUB_SHA} (run ${GITHUB_RUN_ID})." \
+            --prerelease
